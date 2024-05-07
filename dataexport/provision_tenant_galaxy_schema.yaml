@@ -1,0 +1,1720 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  TenantName:
+    Description: Name of the new tenant to provision for SaaS reporting. Do not use dash (-), underscore (_) or uppercase characters, since dash is not allowed in the name of redshift database user and underscore and uppercase character are not allowed in the name of s3 bucket.
+    Type: String
+    Default: Tenant1     
+  ReleaseS3Bucket:
+    Description: Name of the already created release S3 bucket containing redshift schema migration zip file. 
+    Type: String
+    Default: iwo-reporting-releases  
+  PipelineZip:
+    Description: Name of the zip file inside the release S3 bucket which contains redshift schema migration scripts and thoughtspot tenant deployment scripts.
+    Type: String
+    Default: schema-and-tmls-8.10.1.zip
+  FlinkApplicationJar:
+    Description: Name of the Flink application JAR inside the release S3 bucket containing the ETL code in java for Kinesis Data Analytics Application
+    Type: String
+    Default: etl-0.11.1.jar
+  SSMParameterForVpcId:
+    Description: Name of the parameter in AWS Systems Manager Parameter Store containing the id of the VPC. This will be used for resources like CodeBuild, Lambda, and Kinesis Data Analytics application.
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: VpcId
+  SSMParameterForSubnetIds:
+    Description: Name of the parameter in AWS Systems Manager Parameter Store containing the list of subnet ids. This will be used for resources like CodeBuild, Lambda, and Kinesis Data Analytics application. Note the first two ids must be private subnets with NAT gateway since they will be used for CodeBuild, otherwise CodeBuild will not be able to pull migration scripts from S3 bucket or libraries from other sources.
+    Type: AWS::SSM::Parameter::Value<List<String>>
+    Default: SubnetIds
+  SSMParameterForSecurityGroupIds:
+    Description: Name of the parameter in AWS Systems Manager Parameter Store containing the list of security group ids. This will be used for resources like CodeBuild, Lambda, and Kinesis Data Analytics application.
+    Type: AWS::SSM::Parameter::Value<List<String>>
+    Default: SecurityGroupIds
+  KinesisDataStreamName: 
+    Description: name of data stream to reuse. If empty a new data stream is created.
+    Type: String
+  RedshiftSecret:
+    Description: Name of the secret in AWS Secrets Manager containing cluster details. This must include the values ClusterJDBCURL, ClusterIdentifier, dbname, username, and password.
+    Type: String
+    Default: redshift_secret
+  ThoughtSpotTenant:
+    Type: "String"
+    Description: "Flag to create Thoughtspot tenant. Resources will be provisioned if this parameter is set to true."
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+  ThoughtSpotSecret:
+    Description: The secret that contains the ThoughtSpot cluster url and the Deployer credentials
+    Type: String
+    Default: thoughtspot-secret
+  TenantTier:
+    Type: "String"
+    Description: The tenant's billing tier
+    AllowedValues:
+      - 'free'
+      - 'paid'
+    Default: 'free'
+  ThoughtSpotSkipInitialUser:
+    Type: "String"
+    Description: "If creating thoughtspot tenant, set this to true to skip creation of the initial admin user."
+    AllowedValues:
+      - 'True'
+      - 'False'
+    Default: 'False'
+  ThoughtSpotUser:
+    Description: "[OPTIONAL] The first user's username"
+    Type: String
+    Default: ""
+  ThoughtSpotUserEmail:
+    Description: "[OPTIONAL] The first user's email"
+    Type: String
+    Default: ""
+  ThoughtSpotUserDisplayName:
+    Description: "[OPTIONAL] The first user's display name"
+    Type: String
+    Default: ""
+  ThoughtSpotImportPolicy:
+    Type: "String"
+    Description: The policy to use when importing TMLs
+    AllowedValues:
+      - 'PARTIAL'
+      - 'ALL_OR_NONE'
+    Default: 'PARTIAL'    
+  CreateStreamAlarms:
+    Type: "String"
+    Description: "Flag to create cloudwatch alarms. Alarms will be created if this parameter is set to true."
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+  UseMskAsFlinkSource:
+    Description: Flag to set the source for Flink. true for MSK. false for Kinesis Data Streams.
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+  BootstrapServerEndpoints:
+    Description: The public endpoints of the MSK cluster which will be used by the consumer in flink app
+    Type: String
+    Default: b-2-public.iwomskcluster.gz1ghp.c9.kafka.us-east-1.amazonaws.com:9198,b-1-public.iwomskcluster.gz1ghp.c9.kafka.us-east-1.amazonaws.com:9198
+  MSKClusterName:
+    Description: The name of the MSK Cluster.
+    Type: String
+    Default: iwo-msk-cluster    
+  EnableS3BackupInFlink:
+    Description: Flag for enabling/disabling S3 backups of raw MSK data in Flink. true for enabling. false for disabling.
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+  FlinkBackupS3Bucket:
+    Description: Name of the S3 bucket to be used by Flink to backup MSK raw data. 
+    Type: String
+  FlinkBackupS3BucketPrefix:
+    Description: Name of the S3 bucket prefix to be used by Flink to write the MSK topic-specific raw data to. 
+    Type: String
+    Default: backup
+  FlinkParallelism:
+    Description: The number of KPUs that will be set for Flink Config
+    Type: Number
+    Default: 1
+  PipelineFailureEmail:
+    Type: "String"
+    Description: "Build failure notifications will be sent to this email (after manual confirmation)."
+    Default: saralaks@cisco.com
+  ReleaseVersion:
+    Description: The release version artifacts are built off of. The directory should exist within the s3 bucket and should contain the relevant assets. Set to empty as needed to avoid this nested structure.
+    Type: String
+    Default: 8.10.1
+  s3DataExpiry:
+    Description: Expiration in days of S3 objects as part of LifeCycle policy. If backup feature is required, 'never' parameter is recommended.
+    Type: String
+    AllowedValues:
+      - 30days
+      - 90days
+      - 10years
+      - 1day
+      - never
+    Default: 90days 
+  LogGroupExpiry:
+    Description: Retention Period of LogGroup in days. 
+    Type: String
+    AllowedValues:
+      - 30days
+      - 90days
+      - 10years
+      - 1day
+      - never
+    Default: 90days
+Conditions:
+  UseMSK: !Equals [!Ref UseMskAsFlinkSource, 'true']
+  DataStreamEmpty: !Equals [!Ref KinesisDataStreamName, ""]
+  CreateNewDataStream: !And
+  - !Equals [!Ref KinesisDataStreamName, ""]
+  - !Equals [!Ref UseMskAsFlinkSource, 'false']
+  CreateAlarms: !Equals [!Ref CreateStreamAlarms, 'true']
+  FailureEmailPresent: !Not [!Equals [!Ref PipelineFailureEmail, ""]]
+  ReleaseVersionPresent: !Not [!Equals [!Ref ReleaseVersion, ""]]
+  IsS3_ExpiryNever: !Equals [!Ref s3DataExpiry, "never"]
+  IsLogGroupExpiryNever: !Equals [!Ref LogGroupExpiry, "never"]
+  FlinkBackupS3BucketPresent: !Not [!Equals [!Ref FlinkBackupS3Bucket, ""]]
+  CreateThoughtSpotTenant: !Equals [!Ref ThoughtSpotTenant, 'true']
+Mappings:
+  ConfigMap:
+    ResourceTag:
+      Key: map-migrated
+      Value: mig32266   
+    BillingTag:
+      Key: Bill_To_Team
+      Value: IntersightWorkloadOptimizer           
+  RetentionPeriod:
+    default: 
+      30days: 30
+      90days: 90
+      10years: 3653
+      1day: 1
+      never: never   
+Resources:
+  TenantS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    Properties:
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName          
+      BucketName: !Join [ "-", [ !Ref TenantName , "s3", !Ref 'AWS::Region' ] ]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Fn::If:
+          - IsS3_ExpiryNever
+          - !Ref AWS::NoValue
+          - Rules:          
+              - Id: expire
+                Status: Enabled            
+                ExpirationInDays: !FindInMap [RetentionPeriod, default, !Ref s3DataExpiry]
+                Prefix: !Ref TenantName
+              - Id: expirenoncurrent
+                Status: Enabled            
+                NoncurrentVersionExpiration:
+                  NoncurrentDays: !FindInMap [RetentionPeriod, default, !Ref s3DataExpiry]              
+                ExpiredObjectDeleteMarker: true
+                Prefix: !Ref TenantName
+  TagLambda:
+    Type: 'Custom::TagLambda'
+    Properties:
+      ServiceToken: !Sub
+        - 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:random_num_generator'
+        - Optional: "Optional"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+  TenantSecretRS:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Ref TenantName 
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName                     
+      Description: This secret has a dynamically generated secret password.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub
+          - '{"username": "${UserName}_db_writer", "tag": "${Tag}"}'
+          - UserName: !Ref TenantName
+            Tag: !GetAtt TagLambda.tag
+        GenerateStringKey: password
+        PasswordLength: 15
+        ExcludeCharacters: '"@/\'
+        ExcludePunctuation: true
+    DependsOn:
+      - TagLambda
+  TenantSecretDimRS:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub
+        - '${UserName}_DIM'
+        - UserName: !Ref TenantName
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName
+      Description: This secret has a dynamically generated secret password.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub
+          - '{"username": "${UserName}_dim_db_reader"}'
+          - UserName: !Ref TenantName
+        GenerateStringKey: password
+        PasswordLength: 15
+        ExcludeCharacters: '"@/\'
+        ExcludePunctuation: true
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName               
+      RoleName: !Join [ "-", [ !Ref TenantName , "SchemaResources", !Ref 'AWS::Region' ,"Role" ] ]        
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        -
+          PolicyName: AWS-CodePipeline-Service-3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:GetBucketPolicyStatus
+                  - s3:GetBucketTagging
+                  - s3:ListBucketVersions
+                  - s3:GetBucketLogging
+                  - s3:CreateBucket
+                  - s3:ListBucket
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketAcl
+                  - s3:GetBucketNotification
+                  - s3:GetBucketPolicy
+                  - s3:GetEncryptionConfiguration
+                  - s3:GetMetricsConfiguration
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${ReleaseS3Bucket}"
+                  - !Sub "arn:aws:s3:::${ReleaseS3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${ReleaseS3Bucket}/${ReleaseVersion}"
+                  - !Sub "arn:aws:s3:::${ReleaseS3Bucket}/${ReleaseVersion}/*"
+                  - !GetAtt TenantS3Bucket.Arn
+
+              -
+                Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:PutObject
+                  - s3:GetObjectAcl
+                  - s3:GetObject
+                  - s3:RestoreObject
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectTagging
+                  - s3:InitiateReplication
+                  - s3:GetObjectVersionAttributes
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub "arn:aws:s3:::${ReleaseS3Bucket}"
+                  - !Sub "arn:aws:s3:::${ReleaseS3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${ReleaseS3Bucket}/${ReleaseVersion}"
+                  - !Sub "arn:aws:s3:::${ReleaseS3Bucket}/${ReleaseVersion}/*"
+                  - !Sub "arn:aws:s3:::${TenantName}-s3-${AWS::Region}/*"
+                  - !Sub
+                    - '${TenantBucket}/*'
+                    - TenantBucket: !GetAtt TenantS3Bucket.Arn
+              -
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${TenantName}*"
+              -
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:FlinkOperations_lambda"
+  AppPipeline: 
+    Type: AWS::CodePipeline::Pipeline
+    Properties: 
+      Name: !Join [ "-", [ !Ref TenantName , "pipeline", !Ref 'AWS::Region', !Ref PipelineZip ] ]
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName                  
+      RoleArn: 
+        !GetAtt CodePipelineServiceRole.Arn
+      Stages: 
+        - 
+          Name: Source
+          Actions: 
+            - 
+              Name: SourceAction
+              Namespace: SourceVariables
+              ActionTypeId: 
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: S3
+              OutputArtifacts: 
+                - Name: SourceOutput
+              Configuration: 
+                S3Bucket: !Ref ReleaseS3Bucket
+                S3ObjectKey: !If [ReleaseVersionPresent, !Sub "${ReleaseVersion}/${PipelineZip}", !Sub "${PipelineZip}"]
+                PollForSourceChanges: false
+              RunOrder: 1
+        - 
+          Name: TenantRedShiftSchema
+          Actions:
+            -
+              Name: StopFlink
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: 1
+                Provider: Lambda
+              Configuration:
+                FunctionName: FlinkOperations_lambda
+                UserParameters: !Sub '{"ApplicationName": "${TenantName}_app", "Region": "${AWS::Region}" }'
+              RunOrder: 2
+            - 
+              Name: GenerateSchema
+              InputArtifacts:
+                - Name: SourceOutput
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildTenantSchemaProject
+              RunOrder: 3
+            - !If
+              - CreateThoughtSpotTenant
+              -
+                Name: UpdateThoughtSpot
+                InputArtifacts: 
+                  - Name: SourceOutput
+                ActionTypeId: 
+                  Category: Build
+                  Owner: AWS
+                  Version: 1
+                  Provider: CodeBuild
+                Configuration: 
+                  ProjectName: !Ref CodeBuildThoughtSpotProject
+                RunOrder: 4
+              - !Ref "AWS::NoValue"
+      ArtifactStore: 
+        Type: S3
+        Location: !Ref TenantS3Bucket
+    DependsOn:
+      - TenantS3Bucket
+      - FlinkApplication
+  CodeBuildTenantSchemaProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Join [ "-", [ !Ref TenantName , "SchemaResources", !Ref 'AWS::Region', "project" ] ]
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName                  
+      ServiceRole: !Ref CodeBuildRole
+      Artifacts:
+        Type: CODEPIPELINE
+      LogsConfig:
+        CloudWatchLogs:
+          Status: "ENABLED"
+          GroupName: !Sub "${TenantName}_LogGroup"
+          StreamName: !Sub "/aws/codebuild/${TenantName}" 
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:6.0
+        PrivilegedMode: True
+        EnvironmentVariables:
+          - Name: TENANT_NAME
+            Value: !Ref TenantName
+            Type: PLAINTEXT
+          - Name: FLYWAY_USER
+            Value: !Sub "${RedshiftSecret}:username"
+            Type: SECRETS_MANAGER
+          - Name: FLYWAY_URL
+            Value: !Sub "${RedshiftSecret}:ClusterJDBCURL"
+            Type: SECRETS_MANAGER
+          - Name: FLYWAY_PASSWORD
+            Value: !Sub "${RedshiftSecret}:password"
+            Type: SECRETS_MANAGER
+          - Name: TENANT_USER_PASSWORD
+            Value: !Sub "${TenantName}:password"
+            Type: SECRETS_MANAGER
+          - Name: TENANT_DIM_READER_USER_PASSWORD
+            Value: !Sub "${TenantName}_DIM:password"
+            Type: SECRETS_MANAGER
+      Cache:
+        Type: LOCAL
+        Modes: 
+          - LOCAL_DOCKER_LAYER_CACHE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - echo $TENANT_NAME
+                - sudo apt install make -y
+                - make install
+            pre_build:                                                                                      
+              commands:
+                - echo Flyway migration using AWS Codebuild.... 
+                - make flyway-repair
+            build:
+              commands:
+                - echo Build started on `date`
+                - make flyway-migrate
+            post_build:
+              commands:
+                - echo Build completed on `date`     
+      TimeoutInMinutes: 300
+      VpcConfig:
+        SecurityGroupIds: !Ref SSMParameterForSecurityGroupIds
+        Subnets:
+          - !Select [ 0, !Ref SSMParameterForSubnetIds ]
+          - !Select [ 1, !Ref SSMParameterForSubnetIds ]
+
+        VpcId: !Ref SSMParameterForVpcId
+  CodeBuildRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Join [ "-", [ !Ref TenantName , "codebuild-service", !Ref 'AWS::Region', "role" ] ]
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName                  
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSVPCResourceController
+        - arn:aws:iam::aws:policy/AmazonVPCReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+        Version: 2012-10-17
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - 'logs:PutLogEvents'
+                  - 'logs:CreateLogStream'                  
+                Effect: Allow
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup:log-stream:*"   
+              - Action:
+                  - 's3:GetBucketAcl'
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObjectVersion'                  
+                Effect: Allow
+                Resource:
+                  - !GetAtt TenantS3Bucket.Arn                  
+                  - !Sub "arn:aws:s3:::${ReleaseS3Bucket}/${ReleaseVersion}/*"
+                  - !Sub
+                    - '${TenantBucket}/*'
+                    - TenantBucket: !GetAtt TenantS3Bucket.Arn
+              - Action: 
+                  - 'ssm:GetParameters'
+                Effect: Allow
+                Resource: 
+                  - !Sub "arn:aws:ssm:*:${AWS::AccountId}:parameter/*"
+              - Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:ListSecrets
+                  - secretsmanager:DescribeSecret
+                Effect: Allow
+                Resource: 
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${TenantName}*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${RedshiftSecret}*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ThoughtSpotSecret}*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${TenantName}_thoughtspot_user*"
+              - Action:
+                  - secretsmanager:CreateSecret
+                Effect: Allow
+                Resource: 
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${TenantName}_thoughtspot_user*"
+              - Action:
+                  - ec2:CreateNetworkInterfacePermission
+                Effect: Allow
+                Resource: arn:aws:ec2:*:*:network-interface/*
+                Condition:
+                  StringLike:
+                    ec2:Subnet:
+                      - arn:aws:ec2:*:*:subnet/*
+                    ec2:AuthorizedService: codebuild.amazonaws.com
+  CodeBuildThoughtSpotProject:
+    Type: AWS::CodeBuild::Project
+    Condition: CreateThoughtSpotTenant
+    Properties:
+      Name: !Join [ "-", [ !Ref TenantName , "ThoughtSpot", !Ref 'AWS::Region', "project" ] ]
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName
+      ServiceRole: !Ref CodeBuildRole
+      Artifacts:
+        Type: CODEPIPELINE
+      LogsConfig:
+        CloudWatchLogs:
+          Status: "ENABLED"
+          GroupName: !Sub "${TenantName}_LogGroup"
+          StreamName: "/aws/codebuild/ThoughtSpot"
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:6.0
+        PrivilegedMode: True
+        EnvironmentVariables:
+          - Name: TENANT_NAME
+            Value: !Ref TenantName
+            Type: PLAINTEXT
+          - Name: TS_AUTH_USERNAME
+            Value: !Sub "${ThoughtSpotSecret}:TS_USERNAME"
+            Type: SECRETS_MANAGER
+          - Name: TS_AUTH_CLUSTER_URL
+            Value: !Sub "${ThoughtSpotSecret}:TS_CLUSTER"
+            Type: SECRETS_MANAGER
+          - Name: TS_AUTH_PASSWORD
+            Value: !Sub "${ThoughtSpotSecret}:TS_PASSWORD"
+            Type: SECRETS_MANAGER
+          - Name: BUCKET_NAME
+            Value: !Join [ "-", [ !Ref TenantName , "s3", !Ref 'AWS::Region' ] ]
+            Type: PLAINTEXT
+          - Name: RS_DB_USER
+            Value: !Sub "${TenantName}_db_reader"
+            Type: PLAINTEXT
+          - Name: RS_ACCESS_KEY
+            Value: !Ref IAMRedshiftUserReadAccessKey
+            Type: PLAINTEXT
+          - Name: RS_SECRET_KEY
+            Value: !GetAtt IAMRedshiftUserReadAccessKey.SecretAccessKey
+            Type: PLAINTEXT
+          - Name: RS_DATABASE
+            Value: !Sub "${RedshiftSecret}:dbname"
+            Type: SECRETS_MANAGER
+          - Name: RS_CLUSTER_URL
+            Value: !Sub "${RedshiftSecret}:ClusterJDBCURL"
+            Type: SECRETS_MANAGER
+          - Name: RS_SCHEMA_NAME
+            Value: !Ref TenantName
+            Type: PLAINTEXT
+          - Name: FREE_TIER_SKIP_INIT_USER
+            Value: !Ref ThoughtSpotSkipInitialUser
+            Type: PLAINTEXT
+          - Name: FREE_TIER_USERNAME
+            Value: !Ref ThoughtSpotUser
+            Type: PLAINTEXT
+          - Name: FREE_TIER_EMAIL
+            Value: !Ref ThoughtSpotUserEmail
+            Type: PLAINTEXT
+          - Name: FREE_TIER_DISPLAY_NAME
+            Value: !Ref ThoughtSpotUserDisplayName
+            Type: PLAINTEXT
+          - Name: PAID_TIER_USERNAME
+            Value: !Ref ThoughtSpotUser
+            Type: PLAINTEXT
+          - Name: PAID_TIER_EMAIL
+            Value: !Ref ThoughtSpotUserEmail
+            Type: PLAINTEXT
+          - Name: PAID_TIER_DISPLAY_NAME
+            Value: !Ref ThoughtSpotUserDisplayName
+            Type: PLAINTEXT
+          - Name: IMPORT_POLICY
+            Value: !Ref ThoughtSpotImportPolicy
+            Type: PLAINTEXT
+          - Name: RELEASES3_BUCKET
+            Value: !Ref ReleaseS3Bucket
+            Type: PLAINTEXT
+          - Name: RELEASE_VERSION
+            Value: !Ref ReleaseVersion
+            Type: PLAINTEXT   
+          - Name: TENANT_TIER
+            Value: !Ref TenantTier
+            Type: PLAINTEXT
+      Cache:
+        Type: LOCAL
+        Modes:
+          - LOCAL_DOCKER_LAYER_CACHE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - echo $TENANT_NAME
+                - python --version                
+                - aws s3 cp s3://$RELEASES3_BUCKET/$RELEASE_VERSION/turbotscli-$RELEASE_VERSION.zip .
+                - mkdir /codebuild/local-cache/package
+                - unzip turbotscli-$RELEASE_VERSION.zip -d /codebuild/local-cache/package                                       
+                - export PYTHONPATH=/codebuild/local-cache/package 
+                - export PATH=$PATH:/codebuild/local-cache/package/bin
+            pre_build:
+              commands:
+                - |
+                  if [ "$TENANT_TIER" = "free" ]; then
+                    if [ -z $FREE_TIER_USERNAME ]; then export FREE_TIER_USERNAME=$TENANT_NAME.report.editor; fi && \
+                    if [ -z $FREE_TIER_EMAIL ]; then export FREE_TIER_EMAIL=$FREE_TIER_USERNAME@unknown.com; fi && \
+                    if [ -z $FREE_TIER_DISPLAY_NAME ]; then export FREE_TIER_DISPLAY_NAME="Report Editor"; fi 
+                  elif [ "$TENANT_TIER" = "paid" ]; then
+                    if [ -z $PAID_TIER_USERNAME ]; then export PAID_TIER_USERNAME=$TENANT_NAME.report.admin; fi && \
+                    if [ -z $PAID_TIER_EMAIL ]; then export PAID_TIER_EMAIL=$PAID_TIER_USERNAME@unknown.com; fi && \
+                    if [ -z $PAID_TIER_DISPLAY_NAME ]; then export PAID_TIER_DISPLAY_NAME="Report Administrator"; fi
+                  fi
+                - export RS_HOST=`echo $RS_CLUSTER_URL | awk -F "//" '{print $2}' | awk -F ":" '{print $1}' `
+            build:
+              commands:
+                - echo FREE_TIER_SKIP_INIT_USER $FREE_TIER_SKIP_INIT_USER
+                - echo FREE_TIER_USERNAME $FREE_TIER_USERNAME
+                - echo FREE_TIER_EMAIL $FREE_TIER_EMAIL
+                - echo FREE_TIER_DISPLAY_NAME $FREE_TIER_DISPLAY_NAME
+                - echo PAID_TIER_USERNAME $PAID_TIER_USERNAME
+                - echo PAID_TIER_EMAIL $PAID_TIER_EMAIL
+                - echo PAID_TIER_DISPLAY_NAME $PAID_TIER_DISPLAY_NAME
+                - aws s3 cp s3://$BUCKET_NAME/ThoughtSpot/$TENANT_NAME.spec.json .; status_code=$?
+                - |
+                  if [ $status_code -eq 0 ]; then 
+                    echo "Running tenant update" && \
+                    turbotscli admin update tmls/  $TENANT_NAME.spec.json --policy $IMPORT_POLICY && \
+                    echo "tenant updated" \
+                    ||
+                    exit 1
+                  fi
+                - |
+                  if [ $status_code -ne 0 ]; then
+                    echo "Provisioning new ThoughtSpot tenant" && \
+                    (turbotscli admin create tmls/ $TENANT_NAME --output-file $TENANT_NAME.spec.json \
+                        --policy $IMPORT_POLICY \
+                        --recipe $TENANT_TIER \
+                        | tee output.txt && \
+                    echo "tenant provisioned" \
+                    ||  \
+                    (turbotscli admin delete $TENANT_NAME.spec.json && \
+                    rm $TENANT_NAME.spec.json && \
+                    echo "tenant deleted" \
+                    exit 1)) \
+                    && \
+                    username=`grep Username output.txt | awk -F '?' '{print $3}' | tr -d ' '` \
+                    && \
+                    password=`grep Password output.txt | awk -F '?' '{print $3}' | tr -d ' '` \
+                    && \
+                    (aws secretsmanager create-secret \
+                            --name "$TENANT_NAME"_thoughtspot_user \
+                            --description "The credentials for the provisioned ThoughtSpot user" \
+                            --secret-string "{\"username\":\"$username\",\"password\":\"$password\"}" \
+                    || echo "Failed to create secret")
+                  fi
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - aws s3 cp $TENANT_NAME.spec.json s3://$BUCKET_NAME/ThoughtSpot/
+      TimeoutInMinutes: 300
+      VpcConfig:
+        SecurityGroupIds: !Ref SSMParameterForSecurityGroupIds
+        Subnets:
+          - !Select [ 0, !Ref SSMParameterForSubnetIds ]
+          - !Select [ 1, !Ref SSMParameterForSubnetIds ]
+
+        VpcId: !Ref SSMParameterForVpcId
+  ThoughtSpotDeletionLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateThoughtSpotTenant
+    Properties:
+      LogGroupName: !Join [ "/", ["/aws","lambda",!Join [ "-", [ !Ref TenantName, "thoughtspot" ]]]]
+      RetentionInDays:
+        Fn::If:
+          - IsLogGroupExpiryNever
+          - !Ref AWS::NoValue
+          - !FindInMap [RetentionPeriod, default, !Ref LogGroupExpiry]
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref TenantName,"thoughtspot" ]]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName
+  ThoughtSpotDeletionLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateThoughtSpotTenant
+    DependsOn: 
+      - ThoughtSpotDeletionLambdaLogGroup   
+      - TenantS3Bucket   
+    Properties:           
+      Description: A role for Lambda function to delete ThoughtSpot resources.
+      Tags:
+        - Key: Name
+          Value: !Sub "${TenantName}_ThoughtSpotDeletionLambdaRole"
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+      - PolicyName: !Sub "logs-policy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Action:
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+              - 'logs:DeleteLogGroup'
+              - 'logs:DeleteLogStream'
+              - 'logs:DescribeLogStreams'
+              - 'logs:DescribeLogGroups'
+            Effect: Allow
+            Resource:
+              - !GetAtt ThoughtSpotDeletionLambdaLogGroup.Arn 
+      - PolicyName: !Sub "cloudformation-policy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Action:
+              - 'cloudformation:DescribeStacks'
+              - 'cloudformation:ListStacks'
+            Effect: Allow
+            Resource:
+              - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackId}/*"
+      - PolicyName: !Sub "s3-policy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - s3:DeleteObjectVersion
+              - s3:DeleteObject              
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource:
+              - !Sub "arn:aws:s3:::${TenantName}-s3-${AWS::Region}/ThoughtSpot/*"           
+      - PolicyName: AwsLambdaSecretsManagerAccess
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Action:
+              - "secretsmanager:GetSecretValue"
+              - "secretsmanager:DescribeSecret"
+              - "secretsmanager:DeleteSecret"
+              - "secretsmanager:List*"
+            Effect: Allow
+            Resource:      
+              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${TenantName}_thoughtspot_user*"
+      ManagedPolicyArns:
+            - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+            - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /       
+  ThoughtSpotLambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    Condition: CreateThoughtSpotTenant
+    Properties:      
+      CompatibleRuntimes:
+        - python3.9
+        - python3.10
+      Content:
+        S3Bucket: !Ref ReleaseS3Bucket
+        S3Key: !Join [ "/", [ !Ref ReleaseVersion , !Sub "turbotscli-${ReleaseVersion}.zip" ] ]
+      Description: Layer with ThoughtSpot packages
+      LayerName: !Join [ "-", [ !Ref TenantName,"thoughtspot" ]]
+  ThoughtSpotDeletionLambda:
+    Type: AWS::Lambda::Function
+    Condition: CreateThoughtSpotTenant
+    DependsOn: 
+      - ThoughtSpotDeletionLambdaRole
+      - ThoughtSpotDeletionLambdaLogGroup
+      - ThoughtSpotLambdaLayer      
+    Properties:
+      FunctionName: !Join [ "-", [ !Ref TenantName, "thoughtspot" ]]
+      Tags:        
+        - Key: Name
+          Value: !Ref TenantName
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value] 
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+      Description: Remove Thoughtspot resources
+      Runtime: python3.10
+      Layers:
+        - !Ref ThoughtSpotLambdaLayer
+      Role: !GetAtt ThoughtSpotDeletionLambdaRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 900
+      Environment:
+        Variables:
+          TS_AUTH_USERNAME: !Sub "{{resolve:secretsmanager:${ThoughtSpotSecret}:SecretString:TS_USERNAME}}"
+          TS_AUTH_CLUSTER_URL: !Sub "{{resolve:secretsmanager:${ThoughtSpotSecret}:SecretString:TS_CLUSTER}}"
+          TS_AUTH_PASSWORD: !Sub "{{resolve:secretsmanager:${ThoughtSpotSecret}:SecretString:TS_PASSWORD}}"
+          PYTHONPATH: /opt
+      Code:        
+        ZipFile: |
+          import logging
+          import boto3
+          import json          
+          import base64  
+          import cfnresponse
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+            logger.info('Incoming CFN event {}'.format(event))
+            try:
+              # Variables received from the caller stack
+              TenantName = event['ResourceProperties']['TenantName']
+              Region = event['ResourceProperties']['Region']
+              FileName = event['ResourceProperties']['FileName']
+              
+              # Filter out events other than Create or Update                  
+              if event['RequestType'] in ["Create", "Update"]:
+                logger.info('No-op for Application {} because CFN RequestType {} is filtered'.format(TenantName, event['RequestType'])) 
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+              
+              # Take action only when its Delete request
+              if event['RequestType'] in ["Delete"]:
+                logger.info('Delete request received for Application {} because CFN RequestType {} is filtered'.format(TenantName, event['RequestType'])) 
+                                    
+                s3_client = boto3.client('s3', region_name=Region)
+                cf_client = boto3.client('cloudformation')  
+                sm_client = boto3.client('secretsmanager')
+                
+                # Check the status of the calling stack
+                cf_description = cf_client.describe_stacks(StackName=event['StackId'])
+                logger.info('cf_description: {}'.format(cf_description)) 
+                
+                # If the stack has started its delete operation then only remove Thoughtspot resources
+                # DO NOT process faux delete requests
+                for stack_description in cf_description['Stacks']:
+                  logger.info('stack_description: {}'.format(stack_description)) 
+                  if (stack_description['StackStatus'] == 'DELETE_COMPLETE' or stack_description['StackStatus'] == 'DELETE_FAILED' or stack_description['StackStatus'] == 'DELETE_IN_PROGRESS'):
+                    
+                    # Use s3 API to fetch json file
+                    tenant_bucket_name = TenantName + '-s3-' + Region
+                    logger.info('Incoming CFN event {}'.format(tenant_bucket_name))
+                    s3_response = s3_client.get_object(Bucket=tenant_bucket_name,Key=FileName)
+                    jsoncontent = s3_response['Body'].read().decode('utf-8')
+                    #logger.info('response {} '.format(jsoncontent))
+                    
+                    # Write jsoncontent to a file since lambda has readonly filesystem except /tmp
+                    with open('/tmp/spec.json', 'w') as f:
+                      f.write(jsoncontent)
+
+                    # Proceed to delete Thoughtspot's resources & execute tscli command                    
+                    output = os.system('cat /tmp/spec.json')
+                    logger.info('response {} '.format(output)) 
+
+                    # Proceed to delete Thoughtspot's resources & execute tscli command                    
+                    output = os.system('turbotscli --version')
+                    logger.info('response {} '.format(output))                    
+                    
+                    output = os.system('turbotscli admin delete /tmp/spec.json')                    
+                    logger.info('response {} '.format(output))
+                    
+                    # Delete json file
+                    response = s3_client.delete_object(Bucket=tenant_bucket_name,Key=FileName)
+                    logger.info('response {} '.format(response))
+                    output = os.system('rm -rf /tmp/spec.json')                    
+                    logger.info('response {} '.format(output))
+
+                    # Remove user secret
+                    secret = TenantName + "_thoughtspot_user"
+                    response = sm_client.delete_secret(SecretId=secret,RecoveryWindowInDays=7)
+                    logger.info('response {} '.format(response))
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})  
+
+            except Exception as err:
+              logger.error(err)
+              cfnresponse.send(event,context, cfnresponse.FAILED, {"Data": str(err)})
+
+  DeleteThoughtSpotLambdaInvoke:
+    Description: Invokes ThoughtSpotDeletionLambda to delete the thoughtspot resources.
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateThoughtSpotTenant
+    DependsOn: 
+      - ThoughtSpotDeletionLambda
+    Version: "1.0"
+    Properties:
+      Tags:        
+        - Key: Name
+          Value: !Ref TenantName
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value] 
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+      ServiceToken: !GetAtt ThoughtSpotDeletionLambda.Arn
+      TenantName: !Ref TenantName
+      Region: !Ref AWS::Region
+      FileName: !Sub "ThoughtSpot/${TenantName}.spec.json"
+  IAMRedshiftReadUser:
+    Type: 'AWS::IAM::User'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref TenantName
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]          
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]             
+      UserName: !Join
+        - _
+        - - !Ref TenantName
+          - RedshiftReader
+      Policies:
+        - PolicyName: redshiftreadpolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'redshift:GetClusterCredentials'
+                  - 'redshift:Describe*'
+                  - 'redshift:ViewQueriesInConsole'
+                  - 'cloudwatch:Describe*'
+                  - 'cloudwatch:List*'
+                  - 'cloudwatch:Get*'   
+                Resource:
+                  - !Join
+                    - ':'
+                    - - arn
+                      - aws
+                      - redshift
+                      - !Ref 'AWS::Region'
+                      - !Ref 'AWS::AccountId'
+                      - dbname
+                      - !Join
+                        - /
+                        - - !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:ClusterIdentifier}}"
+                          - !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:dbname}}"
+                  - !Join
+                    - ':'
+                    - - arn
+                      - aws
+                      - redshift
+                      - !Ref 'AWS::Region'
+                      - !Ref 'AWS::AccountId'
+                      - dbuser
+                      - !Join
+                        - /
+                        - - !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:ClusterIdentifier}}"
+                          - !Sub "${TenantName}_db_reader"
+  IAMRedshiftUserReadAccessKey:
+    Type: 'AWS::IAM::AccessKey'
+    Properties:
+      UserName: !Ref IAMRedshiftReadUser
+    DependsOn:
+      - IAMRedshiftReadUser
+  IAMRedshiftUserWriteAccessKey:
+    Type: 'AWS::IAM::AccessKey'
+    Properties:
+      UserName: !Ref IAMRedshiftWriteUser
+    DependsOn:
+      - IAMRedshiftWriteUser
+  IAMRedshiftWriteUser:
+    Type: 'AWS::IAM::User'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref TenantName
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]    
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]                 
+      UserName: !Join
+        - _
+        - - !Ref TenantName
+          - RedshiftWriter
+      Policies:
+        - !If
+            - UseMSK
+            - PolicyName: AWSMSKClientAccessPolicy
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - "kafka-cluster:Connect"
+                      - "kafka-cluster:WriteDataIdempotently"
+                    Resource:
+                      - !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:cluster/${MSKClusterName}/*"
+                  - Effect: Allow
+                    Action:
+                      - "kafka-cluster:CreateTopic"
+                      - "kafka-cluster:DescribeTopic"
+                      - "kafka-cluster:WriteData"
+                    Resource:
+                      - !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:topic/${MSKClusterName}/*/${!aws:PrincipalTag/Name}_topic"
+            - PolicyName: redshiftwritepolicy
+              PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - 'kinesis:PutRecords'
+                      - 'kinesis:DescribeStream'
+                    Resource: !If [CreateNewDataStream, !Sub "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${TenantName}_data_stream", !Sub "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${KinesisDataStreamName}"]
+                  - Effect: Allow
+                    Action:
+                      - 'kinesis:ListStreams'
+                      - 'kinesis:ListShards'
+                    Resource: !If [CreateNewDataStream, !Sub "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${TenantName}_data_stream", !Sub "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${KinesisDataStreamName}"]
+  KinesisDataStream:
+    Type: 'AWS::Kinesis::Stream'
+    Condition: CreateNewDataStream
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref TenantName
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]          
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+      Name: !Sub
+        - '${DataStreamName}_data_stream'
+        - DataStreamName: !Ref TenantName
+      RetentionPeriodHours: 24
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      StreamEncryption: 
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      ShardCount: 1     
+  FirehoseDeliveryStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref TenantName
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]   
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]                  
+      DeliveryStreamName: !Sub
+        - '${DataStreamName}_firehose'
+        - DataStreamName: !Ref TenantName
+      DeliveryStreamType: DirectPut
+      RedshiftDestinationConfiguration:
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub "${TenantName}_LogGroup"
+          LogStreamName: !Sub "/aws/kinesis-firehose/${TenantName}"
+        RoleARN: !GetAtt
+          - FirehoseDeliveryStreamIAMRole
+          - Arn
+        ClusterJDBCURL: !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:ClusterJDBCURL}}"
+        CopyCommand:
+          DataTableName: !Join
+            - .
+            - - !Ref TenantName
+              - timeseries
+          CopyOptions: FORMAT JSON 'noshred'
+        Username: !Sub
+          - "{{resolve:secretsmanager:${TenantName}:SecretString:username}}"
+          - TenantName: !Ref TenantName
+        Password: !Sub
+          - "{{resolve:secretsmanager:${TenantName}:SecretString:password}}"
+          - TenantName: !Ref TenantName
+        RetryOptions:
+          DurationInSeconds: 3600
+        S3Configuration:
+          RoleARN: !GetAtt
+            - FirehoseDeliveryStreamIAMRole
+            - Arn
+          BucketARN: !Sub
+            - "arn:aws:s3:::${S3BucketName}"
+            - S3BucketName: !Ref TenantS3Bucket
+          Prefix: !Sub ${TenantName}/
+    DependsOn:
+      - FirehoseDeliveryStreamIAMRole
+      - TenantSecretRS
+      - TenantS3Bucket
+  FirehoseDeliveryStreamIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref TenantName
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]          
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+      RoleName: !Join
+        - '-'
+        - - !Ref TenantName
+          - !Ref 'AWS::Region'
+          - firehose-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: firehose-s3-cloudwatch-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:AbortMultipartUpload'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${S3BucketName}"
+                    - S3BucketName: !Ref TenantS3Bucket
+                  - !Sub
+                    - "arn:aws:s3:::${S3BucketName}/*"
+                    - S3BucketName: !Ref TenantS3Bucket
+              - Effect: Allow
+                Action:
+                  - 'logs:PutLogEvents'
+                  - 'logs:CreateLogStream'
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup:log-stream:/aws/kinesis-firehose/${TenantName}*"
+    DependsOn:
+      - TenantS3Bucket
+  FlinkServiceExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn: FirehoseDeliveryStream
+    Properties:
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName
+      ManagedPolicyArns:
+        - !If [UseMSK, !Ref AWS::NoValue, arn:aws:iam::aws:policy/AmazonVPCFullAccess]
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kinesisanalytics.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: redshift-connection-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'redshift:GetClusterCredentials'
+                  - 'redshift-data:ExecuteStatement'
+                Resource:
+                  - !Join
+                    - ':'
+                    - - arn
+                      - aws
+                      - redshift
+                      - !Ref 'AWS::Region'
+                      - !Ref 'AWS::AccountId'
+                      - dbname
+                      - !Join
+                        - /
+                        - - !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:ClusterIdentifier}}"
+                          - !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:dbname}}"
+                  - !Join
+                    - ':'
+                    - - arn
+                      - aws
+                      - redshift
+                      - !Ref 'AWS::Region'
+                      - !Ref 'AWS::AccountId'
+                      - dbuser
+                      - !Join
+                        - /
+                        - - !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:ClusterIdentifier}}"
+                          - !Sub "${TenantName}_dim_db_reader"
+                  - !Join
+                    - ':'
+                    - - arn
+                      - aws
+                      - redshift
+                      - !Ref 'AWS::Region'
+                      - !Ref 'AWS::AccountId'
+                      - cluster
+                      - !Join
+                        - ':'
+                        - - !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:ClusterIdentifier}}"
+              - Effect: Allow
+                Action: 
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                Resource: '*'    
+        - !If
+            - UseMSK
+            - PolicyName: msk-permission-for-flink
+              PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - s3:GetObject
+                    Resource:
+                      - !Sub "arn:aws:s3:::${ReleaseS3Bucket}/${FlinkApplicationJar}"
+                      - !Sub "arn:aws:s3:::${ReleaseS3Bucket}/${ReleaseVersion}/${FlinkApplicationJar}"
+                  - Action:
+                      - kafka-cluster:Connect
+                    Effect: Allow
+                    Resource: 
+                      - !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:cluster/${MSKClusterName}/*"
+                  - Action: 
+                      - kafka-cluster:CreateTopic
+                      - kafka-cluster:DescribeTopic
+                      - kafka-cluster:ReadData
+                    Effect: Allow
+                    Resource: 
+                      - !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:topic/${MSKClusterName}/*/${TenantName}_topic"
+                  - Action: 
+                      - kafka-cluster:AlterGroup
+                      - kafka-cluster:DescribeGroup
+                    Effect: Allow
+                    Resource: 
+                      - !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:group/${MSKClusterName}/*"
+                  - Action:
+                      - logs:PutLogEvents
+                      - logs:CreateLogStream
+                      - logs:DescribeLogGroups
+                      - logs:DescribeLogStreams
+                    Effect: Allow
+                    Resource:
+                      - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup"
+                      - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup:log-stream:/aws/kinesis-analytics/${TenantName}_app*"
+                      - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup:log-stream:*"
+                  - Action:
+                      - firehose:PutRecordBatch
+                    Effect: Allow
+                    Resource: !GetAtt FirehoseDeliveryStream.Arn
+                  - Sid: VPCReadOnlyPermissions
+                    Effect: Allow
+                    Action:
+                      - ec2:DescribeVpcs
+                      - ec2:DescribeSubnets
+                      - ec2:DescribeSecurityGroups
+                      - ec2:DescribeDhcpOptions
+                    Resource: "*"
+                  - Sid: ENIReadWritePermissions
+                    Effect: Allow
+                    Action:
+                      - ec2:CreateNetworkInterface
+                      - ec2:CreateNetworkInterfacePermission
+                      - ec2:DescribeNetworkInterfaces
+                      - ec2:DeleteNetworkInterface
+                    Resource: "*"
+                  - Sid: FlinkS3ReadWritePermissions
+                    Effect: Allow
+                    Action:
+                      - s3:GetObject
+                      - s3:PutObject
+                      - s3:ListObjectsV2
+                      - s3:ListBucket
+                    Resource:
+                      Fn::If:
+                        - FlinkBackupS3BucketPresent
+                        -  
+                          - !Sub "arn:aws:s3:::${FlinkBackupS3Bucket}"
+                          - !Sub "arn:aws:s3:::${FlinkBackupS3Bucket}/${FlinkBackupS3BucketPrefix}/*"
+                        - 
+                          - !Sub "arn:aws:s3:::${TenantS3Bucket}"
+                          - !Sub "arn:aws:s3:::${TenantS3Bucket}/${FlinkBackupS3BucketPrefix}/*"
+            - PolicyName: flink-execution-access
+              PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - s3:GetObject
+                    Resource:
+                      - !Sub
+                        - "arn:aws:s3:::${S3BucketName}/${CodeContentFileKey}"
+                        - S3BucketName: !Ref ReleaseS3Bucket
+                          CodeContentFileKey: !Sub "${FlinkApplicationJar}"
+                      - !Sub
+                        - "arn:aws:s3:::${S3BucketName}/${CodeContentFileKey}"
+                        - S3BucketName: !Ref ReleaseS3Bucket
+                          CodeContentFileKey: !Sub "${ReleaseVersion}/${FlinkApplicationJar}"
+                  - Action:
+                      - logs:PutLogEvents
+                      - logs:CreateLogStream
+                      - logs:DescribeLogGroups
+                      - logs:DescribeLogStreams
+                    Effect: Allow
+                    Resource: 
+                      - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup"
+                      - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup:log-stream:/aws/kinesis-analytics/${TenantName}_app*"
+                      - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TenantName}_LogGroup:log-stream:*"
+                  - Action:
+                      - kinesis:DescribeStream
+                      - kinesis:GetShardIterator
+                      - kinesis:GetRecords
+                      - kinesis:ListShards
+                    Effect: Allow
+                    Resource: !If [CreateNewDataStream, !Sub "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${TenantName}_data_stream", !Sub "arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${KinesisDataStreamName}"]
+                  - Action:
+                      - firehose:PutRecordBatch
+                    Effect: Allow
+                    Resource: !GetAtt FirehoseDeliveryStream.Arn
+                  - Action:
+                      - s3:GetObject
+                      - s3:PutObject
+                      - s3:ListObjectsV2
+                      - s3:ListBucket
+                    Effect: Allow
+                    Resource: 
+                      Fn::If:
+                        - FlinkBackupS3BucketPresent
+                        -  
+                          - !Sub "arn:aws:s3:::${FlinkBackupS3Bucket}"
+                          - !Sub "arn:aws:s3:::${FlinkBackupS3Bucket}/${FlinkBackupS3BucketPrefix}/*"
+                        - 
+                          - !Sub "arn:aws:s3:::${TenantS3Bucket}"
+                          - !Sub "arn:aws:s3:::${TenantS3Bucket}/${FlinkBackupS3BucketPrefix}/*"
+  FlinkApplication:
+    Type: 'AWS::KinesisAnalyticsV2::Application'
+    Properties:
+      ApplicationConfiguration:
+        ApplicationSnapshotConfiguration:
+          SnapshotsEnabled: false
+        EnvironmentProperties:
+          PropertyGroups:
+            - PropertyGroupId: 'ConsumerConfigProperties'
+              PropertyMap:
+                INPUT_STREAM_NAME: 
+                                !If 
+                                - CreateNewDataStream
+                                - !Sub "${TenantName}_data_stream"
+                                - 
+                                  !If 
+                                  - DataStreamEmpty
+                                  - "unused"
+                                  - !Ref KinesisDataStreamName
+                INPUT_STREAM_REGION: !Ref AWS::Region
+            - PropertyGroupId: 'ProducerConfigProperties'
+              PropertyMap:
+                OUTPUT_STREAM_NAME: !Ref FirehoseDeliveryStream
+            - PropertyGroupId: 'JobProperties'
+              PropertyMap:
+                dbURL: !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:ClusterJDBCURL}}"
+                maxParallel: 64
+                redshift.pollingPeriodMins: 5
+                schema: !Ref TenantName
+                username: !Sub '${TenantName}_dim_db_reader'
+                kafkaTopic: !Sub '${TenantName}_topic'
+                kafkaConsumerGroup: !Sub '${TenantName}_consumer_group'
+                kafkaBootstrapServers: !Sub '${BootstrapServerEndpoints}'
+                kafkaIngestion: !Ref UseMskAsFlinkSource 
+                enableBackup: !Ref EnableS3BackupInFlink
+                backupBucket: 
+                  Fn::If:
+                    - FlinkBackupS3BucketPresent
+                    - !Ref FlinkBackupS3Bucket
+                    - !Ref TenantS3Bucket
+                backupPrefix: !Ref FlinkBackupS3BucketPrefix
+        FlinkApplicationConfiguration:
+          CheckpointConfiguration:
+            ConfigurationType: 'DEFAULT'
+          MonitoringConfiguration:
+            ConfigurationType: 'CUSTOM'
+            LogLevel: 'INFO'
+          ParallelismConfiguration:
+            AutoScalingEnabled: false
+            ConfigurationType: 'CUSTOM'
+            Parallelism: !Ref FlinkParallelism
+            ParallelismPerKPU: 1
+        ApplicationCodeConfiguration:
+          CodeContent:
+            S3ContentLocation:
+              BucketARN: !Sub "arn:aws:s3:::${ReleaseS3Bucket}"
+              FileKey: !If [ReleaseVersionPresent, !Sub "${ReleaseVersion}/${FlinkApplicationJar}", !Sub "${FlinkApplicationJar}"]
+          CodeContentType: 'ZIPFILE'
+        VpcConfigurations:
+          - SecurityGroupIds: !Ref SSMParameterForSecurityGroupIds
+            SubnetIds: !Ref SSMParameterForSubnetIds
+      ApplicationDescription: 'ETL for the galaxy schema in redshift'
+      ApplicationName: !Sub '${TenantName}_app'
+      RunConfiguration:
+        ApplicationRestoreConfiguration:
+          ApplicationRestoreType: 'SKIP_RESTORE_FROM_SNAPSHOT'
+      RuntimeEnvironment: 'FLINK-1_15'
+      ServiceExecutionRole: !GetAtt FlinkServiceExecutionRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Ref TenantName
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]    
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]                 
+    DependsOn:
+      - FirehoseDeliveryStream
+  FlinkApplicationCloudWatchLoggingOption:
+    Type: AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption
+    Properties:  
+      ApplicationName: !Ref FlinkApplication
+      CloudWatchLoggingOption:
+        LogStreamARN: !Join
+          - ":"
+          - - arn:aws:logs
+            - !Ref AWS::Region
+            - !Ref AWS::AccountId
+            - log-group
+            - !Sub "${TenantName}_LogGroup"
+            - log-stream
+            - !Sub "/aws/kinesis-analytics/${TenantName}_app"
+    DependsOn:
+      - FlinkApplicationLogStream
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${TenantName}_LogGroup"
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName
+      RetentionInDays: 
+        Fn::If:
+          - IsLogGroupExpiryNever
+          - !Ref AWS::NoValue
+          - !FindInMap [RetentionPeriod, default, !Ref LogGroupExpiry]
+  CodeBuildLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Sub "${TenantName}_LogGroup"
+      LogStreamName: !Sub "/aws/codebuild/${TenantName}"
+    DependsOn:
+      - CodeBuildLogGroup
+  KinesisFirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Sub "${TenantName}_LogGroup"
+      LogStreamName: !Sub "/aws/kinesis-firehose/${TenantName}"
+    DependsOn:
+      - CodeBuildLogGroup
+  FlinkApplicationLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Sub "${TenantName}_LogGroup"
+      LogStreamName: !Sub "/aws/kinesis-analytics/${TenantName}_app"
+    DependsOn:
+      - CodeBuildLogGroup
+  TenantMonitoringDashboard:
+    Type: "AWS::CloudWatch::Dashboard"
+    Properties:
+      DashboardName: !Sub ${TenantName}-monitoring
+      DashboardBody:
+        !Sub '{"widgets":[{"height":1,"width":24,"y":0,"x":0,"type":"text","properties":{"markdown":"MSK Metrics "}},{"height": 6,"width": 4,"y": 1,"x": 0,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(BytesInPerSec) FROM SCHEMA(\"AWS/Kafka\", \"Broker ID\",\"Cluster Name\",Topic) WHERE Topic = ''${TenantName}_topic'' AND \"Cluster Name\" = ''${MSKClusterName}''", "label": "BytesInPerSec", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","period": 300,"stat": "Average","title": "BytesIn per second","yAxis": {"left": {"label": "","showUnits": false},"right": {"showUnits": false}}}}, {"height": 6,"width": 4,"y": 1,"x": 4,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(BytesOutPerSec) FROM SCHEMA(\"AWS/Kafka\", \"Broker ID\",\"Cluster Name\",Topic) WHERE Topic = ''${TenantName}_topic'' AND \"Cluster Name\" = ''${MSKClusterName}''", "label": "BytesOutPerSec", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","period": 300,"stat": "Average","title": "BytesOut per second","yAxis": {"left": {"label": "","showUnits": false},"right": {"showUnits": false}}}},{"height": 6,"width": 4,"y": 1,"x": 8,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(SumOffsetLag ) FROM \"AWS/Kafka\" WHERE Topic = ''${TenantName}_topic'' AND \"Cluster Name\" = ''${MSKClusterName}''", "label": "SumOffsetLag", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","period": 300,"stat": "Average","yAxis": {"right": {"showUnits": false},"left": {"showUnits": false}},"title": "SumOffsetLag"}},{"height": 6,"width": 4,"y": 1,"x": 16,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(MemoryFree) FROM \"AWS/Kafka\" WHERE \"Cluster Name\"  = ''${MSKClusterName}''", "label": "", "id": "q1", "region": "${AWS::Region}", "visible": false } ],[ { "expression": "q1/1000000", "label": "MemoryFree (MB)", "id": "e1", "region": "${AWS::Region}" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","period": 300,"stat": "Average","title": "Cluster MemoryFree (MB)","yAxis": {"left": {"showUnits": false},"right": {"showUnits": false}}}},{"height": 6,"width": 4,"y": 1,"x": 12,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(EstimatedMaxTimeLag) FROM \"AWS/Kafka\" WHERE Topic = ''${TenantName}_topic''  AND \"Cluster Name\" = ''${MSKClusterName}''", "label": "EstimatedMaxTimeLag", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","stat": "Average","period": 300,"title": "EstimatedMaxTimeLag (seconds)","yAxis": {"right": {"showUnits": false},"left": {"showUnits": false}}}},{"height": 6,"width": 4,"y": 1,"x": 20,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(HeapMemoryAfterGC) FROM \"AWS/Kafka\" WHERE \"Cluster Name\" = ''${MSKClusterName}''", "label": "HeapMemoryAfterGC (%)", "id": "q1" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","stat": "Average","period": 300,"title": "HeapMemoryAfterGC (%)","yAxis": {"left": {"showUnits": false}}}},{"height":1,"width":24,"y":7,"x":0,"type":"text","properties":{"markdown":"Flink Application Metrics "}},{"height":1,"width":24,"y":14,"x":0,"type":"text","properties":{"markdown":"Firehose Stream Metrics "}},{"height":6,"width":4,"y":8,"x":4,"type":"metric","properties":{"metrics":[["AWS\/KinesisAnalytics","millisBehindLatest","Id","${TenantName}_data_stream","Application","${TenantName}_app","Flow","Input",{"region":"${AWS::Region}","label":"MillisBehindLatest"}]],"view":"timeSeries","stacked":false,"region":"${AWS::Region}","period":300,"stat":"Average","sparkline":true,"yAxis":{"left":{"showUnits":false,"label":"Milliseconds"}},"title":"MillisBehindLatest"}},{"height":6,"width":4,"y":8,"x":8,"type":"metric","properties":{"metrics":[["AWS\/KinesisAnalytics","numberOfFailedCheckpoints","Application","${TenantName}_app",{"region":"${AWS::Region}","color":"#d62728"}]],"view":"timeSeries","stacked":false,"region":"${AWS::Region}","period":300,"title":"Failed Checkpoints","stat":"Average","yAxis":{"left":{"showUnits":false,"label":"count"}}}},{"height":6,"width":6,"y":8,"x":12,"type":"metric","properties":{"view":"timeSeries","stacked":true,"metrics":[["AWS\/KinesisAnalytics","numRecordsOutPerSecond","Application","${TenantName}_app",{"region":"${AWS::Region}"}],[".","numRecordsInPerSecond",".",".",{"region":"${AWS::Region}"}]],"region":"${AWS::Region}","period":300,"title":"Number of records in\/out per second","yAxis":{"left":{"showUnits":false,"label":"(records\/second)"}}}},{"height":6,"width":5,"y":15,"x":0,"type":"metric","properties":{"metrics":[[{"expression":"m1\/300","label":"IncomingRecordsPerSecond","id":"e1","region":"${AWS::Region}"}],["AWS\/Firehose","IncomingRecords","DeliveryStreamName","${TenantName}_firehose",{"region":"${AWS::Region}","id":"m1","visible":false}],[".","RecordsPerSecondLimit",".",".",{"region":"${AWS::Region}","id":"m2","color":"#d62728"}]],"view":"timeSeries","stacked":false,"region":"${AWS::Region}","period":300,"stat":"Sum","yAxis":{"left":{"showUnits":false,"label":"(records\/second)"}},"title":"IncomingRecordsPerSecond vs limit"}},{"height":6,"width":4,"y":15,"x":10,"type":"metric","properties":{"metrics":[["AWS\/Firehose","ThrottledRecords","DeliveryStreamName","${TenantName}_firehose",{"id":"m2","region":"${AWS::Region}","visible":false}]],"view":"timeSeries","stacked":false,"region":"${AWS::Region}","stat":"Sum","period":300,"title":"ThrrottledRecords ","yAxis":{"left":{"showUnits":false,"label":"count"}}}},{"height":6,"width":5,"y":15,"x":14,"type":"metric","properties":{"metrics":[[{"expression":"METRICS(\"m1\") * 100","label":"Delivery to Redshift success (%)","id":"e1","region":"${AWS::Region}"}],[{"expression":"METRICS(\"m2\") * 100","label":"Delivery to S3 success (%)","id":"e2","region":"${AWS::Region}"}],["AWS\/Firehose","DeliveryToRedshift.Success","DeliveryStreamName","${TenantName}_firehose",{"region":"${AWS::Region}","id":"m1","visible":false}],[".","DeliveryToS3.Success",".",".",{"region":"${AWS::Region}","id":"m2","visible":false}]],"view":"timeSeries","stacked":false,"region":"${AWS::Region}","period":300,"stat":"Average","title":"Delivery to S3 and Redshift success (%)","yAxis":{"left":{"max":100,"label":"percent","showUnits":false}}}},{"height":6,"width":6,"y":8,"x":18,"type":"metric","properties":{"metrics":[["AWS\/KinesisAnalytics","cpuUtilization","Application","${TenantName}_app",{"region":"${AWS::Region}"}],[".","heapMemoryUtilization",".",".",{"region":"${AWS::Region}"}]],"view":"timeSeries","stacked":false,"region":"${AWS::Region}","period":300,"title":"Utilization (%)","stat":"Average","yAxis":{"left":{"max":100,"label":"percent","showUnits":false}}}},{"height":6,"width":4,"y":8,"x":0,"type":"metric","properties":{"metrics":[["AWS\/KinesisAnalytics","uptime","Application","${TenantName}_app",{"region":"${AWS::Region}","id":"m1"}],[".","fullRestarts",".",".",{"region":"${AWS::Region}","stat":"Sum","id":"m2"}],[".","downtime",".",".",{"region":"${AWS::Region}","id":"m3","color":"#d62728"}]],"view":"timeSeries","stacked":false,"region":"${AWS::Region}","period":300,"stat":"Average","title":"Application up\/down","yAxis":{"left":{"showUnits":false}}}},{"height":6,"width":5,"y":15,"x":19,"type":"metric","properties":{"metrics":[["AWS\/Firehose","DeliveryToS3.DataFreshness","DeliveryStreamName","${TenantName}_firehose",{"region":"${AWS::Region}"}]],"view":"timeSeries","stacked":false,"region":"${AWS::Region}","period":300,"stat":"Maximum","title":"Data freshness-Delivery to S3(seconds)"}},{"height":6,"width":5,"y":15,"x":5,"type":"metric","properties":{"metrics":[[{"expression":"m2\/300","label":"IncomingPutRequests PerSecond","id":"e1","region":"${AWS::Region}"}],["AWS\/Firehose","PutRequestsPerSecondLimit","DeliveryStreamName","${TenantName}_firehose",{"region":"${AWS::Region}","id":"m1","color":"#d62728"}],[".","IncomingPutRequests",".",".",{"region":"${AWS::Region}","id":"m2","visible":false}]],"view":"timeSeries","stacked":false,"region":"${AWS::Region}","period":300,"stat":"Sum","title":"Incoming PutRequestsPerSecond vs limit","yAxis":{"left":{"showUnits":false,"label":"(records\/second)"}}}}]}'
+  NoDataForDeliveryStreamAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub ${TenantName}_firehose-no-data-alarm
+      AlarmDescription: !Sub Alarm for ${TenantName}_firehose delivery stream that checks if stream has not received data for one day
+      ActionsEnabled: false
+      OKActions: []
+      AlarmActions: [ !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:pipeline-alert-topic" ]
+      InsufficientDataActions: [ ]
+      MetricName: IncomingRecords
+      Namespace: AWS/Firehose
+      Statistic: Average
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Sub ${TenantName}_firehose
+      Period: 600
+      EvaluationPeriods: 144
+      DatapointsToAlarm: 144
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+  NoDataForDataStreamAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub ${TenantName}_data_stream-no-data-alarm
+      AlarmDescription: !Sub Alarm for ${TenantName}_data_stream that checks if stream has not received data for one day
+      ActionsEnabled: false
+      OKActions: []
+      AlarmActions: [ !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:pipeline-alert-topic" ]
+      InsufficientDataActions: [ ]
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Average
+      Dimensions:
+        - Name: StreamName
+          Value: !Sub ${TenantName}_data_stream
+      Period: 600
+      EvaluationPeriods: 144
+      DatapointsToAlarm: 144
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+  PipelineFailureRule:
+    Type: AWS::CodeStarNotifications::NotificationRule
+    Condition: FailureEmailPresent
+    Properties:
+      Name: !Join [ "-", [ !Ref TenantName, !Ref 'AWS::Region', 
+        !Join [ "_", !Split [ '.', !Ref PipelineZip ]]] ]
+      DetailType: FULL
+      EventTypeIds: 
+        - codepipeline-pipeline-action-execution-failed
+      Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppPipeline}"
+      Targets:
+        - TargetType: SNS
+          TargetAddress: !Ref PipelineFailureTopic
+    DependsOn:
+      - PipelineFailureNotification
+      - PipelineFailureTopic
+  PipelineFailureNotification:
+    Type: AWS::SNS::Subscription
+    Condition: FailureEmailPresent
+    Properties: 
+      Protocol: "email"
+      Endpoint: !Ref PipelineFailureEmail
+      TopicArn: !Ref PipelineFailureTopic
+    DependsOn: 
+      - PipelineFailureTopic
+  PipelineFailureTopic:
+    Type: AWS::SNS::Topic
+    Condition: FailureEmailPresent
+    Properties: 
+      DisplayName: !Ref TenantName
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+        - Key: !FindInMap [ConfigMap, BillingTag, Key]
+          Value: !FindInMap [ConfigMap, BillingTag, Value]           
+        - Key: Name
+          Value: !Ref TenantName
+  PipelineFailureTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: FailureEmailPresent
+    Properties:
+      Topics:
+        - !Ref PipelineFailureTopic
+      PolicyDocument: 
+        Statement:
+          Effect: Allow
+          Action: sns:Publish
+          Principal:
+            Service: codestar-notifications.amazonaws.com
+          Resource: !Ref PipelineFailureTopic
+  StartFlinkAfterSchemaUpdate:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "EventRule for invoking lambda function to start flink application after Redshift schema update."
+      Name: !Join [ "-", [ !Ref TenantName , !Ref 'AWS::Region', 'start-flink' ] ]
+      EventPattern:
+        source:
+          - "aws.codepipeline"
+        detail-type:
+          - "CodePipeline Action Execution State Change"
+        detail:
+          pipeline:
+            - prefix: !Join [ "-", [ !Ref TenantName , "pipeline", !Ref 'AWS::Region']]
+          stage:
+            - "TenantRedShiftSchema"
+          action:
+            - "GenerateSchema"
+          state:
+            - "FAILED"
+            - "SUCCEEDED"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:FlinkOperations_lambda'
+          Id: "StartFlink"
+          Input: !Sub |
+            {
+              "ApplicationName": "${TenantName}_app",
+              "Region": "${AWS::Region}"
+            }
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:FlinkOperations_lambda'
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt StartFlinkAfterSchemaUpdate.Arn
+Outputs:
+  ReadUserAccessKeyId:
+    Value: !Ref IAMRedshiftUserReadAccessKey
+  ReadUserSecretAccessKey:
+    Value: !GetAtt IAMRedshiftUserReadAccessKey.SecretAccessKey
+  WriteUserAccessKeyId:
+    Value: !Ref IAMRedshiftUserWriteAccessKey
+  WriteUserSecretAccessKey:
+    Value: !GetAtt IAMRedshiftUserWriteAccessKey.SecretAccessKey
+  Tag:
+    Value: !GetAtt TagLambda.tag
+  ThoughtSpotUserSecret:
+    Value: !Sub "${TenantName}_thoughtspot_user"

@@ -1,0 +1,659 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Cloudformation Stack template to create common resources for respective environment/AWS account for all tenants"
+Parameters:
+  Email:
+    Type: String
+    Description: Email to send alert notification
+  ClusterName:
+    Description: The name of the MSK Cluster.
+    Type: String
+  ClusterInstanceType:
+    Description: The type of Amazon EC2 instances to use for brokers in MSK Cluster. Default is kafka.m5.large.
+    Type: String
+    AllowedValues:
+      - kafka.t3.small
+      - kafka.m5.large
+      - kafka.m5.xlarge
+      - kafka.m5.2xlarge
+      - kafka.m5.4xlarge
+      - kafka.m5.8xlarge
+      - kafka.m5.12xlarge
+      - kafka.m5.16xlarge
+      - kafka.m5.24xlarge
+    Default: kafka.m5.large
+  NoOfBrokers:
+    Description: The number of brokers in the MSK Cluster. Should be at least 2.
+    Type: Number
+    Default: 3
+  EBSVolumePerBroker:
+    Description: The size in GiB of the EBS volume for the data drive on each broker node. Minimum - 1 GiB, Maximum - 16384 GiB
+    Type: Number
+    Default: 500
+  ClusterPublicAccess:
+    Description: This property will be used to enable or disable Public Access for the MSK Cluster. Use DISABLED during the first time stack creation and then update the stack with SERVICE_PROVIDED_EIPS to enable Public Access for the cluster.
+    Type: String
+    AllowedValues:
+      - DISABLED
+      - SERVICE_PROVIDED_EIPS
+    Default: DISABLED
+  SSMParameterForVpcId:
+    Description: Name of the parameter in AWS Systems Manager Parameter Store containing the id of the VPC. This will be used for AWS MSK Cluster. This VPC needs to the same as that used for AWS Redshift and other resources used by tenants.
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: VpcId
+  SSMParameterForSubnetIds:
+    Description: Name of the parameter in AWS Systems Manager Parameter Store containing the list of public subnet ids. This will be used for AWS MSK Cluster.
+    Type: AWS::SSM::Parameter::Value<List<String>>
+    Default: PublicSubnetIds
+  SSMParameterForSecurityGroupIds:
+    Description: Name of the parameter in AWS Systems Manager Parameter Store containing the list of security group ids. This will be used for AWS MSK Cluster.
+    Type: AWS::SSM::Parameter::Value<List<String>>
+    Default: SecurityGroupIds
+  RedshiftSecret:
+    Description: Name of the secret in AWS Secrets Manager containing Redshift cluster details. This must include the values ClusterJDBCURL, ClusterIdentifier, dbname, username, and password.
+    Type: String
+    Default: redshift_secret
+  AgeOfDeletedStackInDays:
+    Description: To specify in days how old is the deleted stack for which user wants to delete the leftover resources to tell Lambda how far back to look amongst many deleted stacks. Default is set as 90 as CloudFormartion stores summary for deleted stacks for 90 days after stack has been deleted, and we want to check upto last 90 days for the first Lambda invocation. This value can eventually be reduced to 30 as Lambda would be invoked more frequently for deletion and would not need to look as far back as 90 days. This parameter will be used by ResourceDeletionLambda.
+    ConstraintDescription: Unsigned integer values between 1-90 only is allowed.
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 90
+Mappings:
+  ConfigMap:
+    ResourceTag:
+      Key: map-migrated
+      Value: mig32266
+
+Resources:
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Sub ${Email}
+          Protocol: "email"
+      TopicName: pipeline-alert-topic
+  SummaryDashboard:
+    Type: "AWS::CloudWatch::Dashboard"
+    Properties:
+        DashboardName: Data-Ingestion-Summary
+        DashboardBody:
+            !Sub '{"widgets":[ {"height": 6,"width": 6,"y": 1,"x": 0,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(BytesInPerSec) FROM \"AWS/Kafka\" WHERE \"Topic\" != ''__amazon_msk_canary'' and \"Topic\" != ''Other'' and \"Topic\" != ''__consumer_offsets'' GROUP BY Topic", "label": "", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","region": "${AWS::Region}","title": "BytesInPerSecond (All Topics)","yAxis": {"left": { "label": "", "showUnits": false},"right": {"showUnits": false}},"stat": "Average","period": 300,"stacked": false}},{"height": 1,"width": 24,"y": 0,"x": 0,"type": "text","properties": {"markdown": "MSK Cluster Summary"}},{"height": 6,"width": 6,"y": 1,"x": 6,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(BytesOutPerSec) FROM \"AWS/Kafka\" WHERE \"Topic\" != ''__amazon_msk_canary'' and \"Topic\" != ''Other'' and \"Topic\" != ''__consumer_offsets'' GROUP BY Topic", "label": "", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","region": "${AWS::Region}","title": "BytesOutPerSecond (All Topics)","yAxis": {"left": { "label": "", "showUnits": false},"right": {"showUnits": false}},"stat": "Average","period": 300,"stacked": false}},{"height": 6,"width": 6,"y": 7,"x": 0,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(MemoryUsed)FROM \"AWS/Kafka\" GROUP BY \"Cluster Name\"", "label": "", "id": "q1", "region": "${AWS::Region}", "visible": false } ],[ { "expression": "q1/1000000", "label": "", "id": "e1" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","stat": "Average","period": 300,"title": "Used-Cluster Memory (MB)","yAxis": {"left": { "label": "MB", "showUnits": false},"right": {"showUnits": false}}}},{"height": 6,"width": 6,"y": 7,"x": 12,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(NetworkRxDropped) FROM \"AWS/Kafka\" GROUP BY \"Cluster Name\"", "label": "", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","stat": "Average","period": 300,"title": "Dropped Rx packages","yAxis": {"left": {"showUnits": false},"right": {"showUnits": false}}}},{"height": 6,"width": 6,"y": 7,"x": 6,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(CPUCreditBalance) FROM SCHEMA(\"AWS/Kafka\", \"Broker ID\",\"Cluster Name\") GROUP BY \"Cluster Name\"", "label": "", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","stat": "Average","period": 300,"title": "CPUCreditBalance","yAxis": {"left": { "label": "", "showUnits": false},"right": {"showUnits": false}}}},{"height": 6,"width": 6,"y": 1,"x": 12,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(SumOffsetLag) FROM \"AWS/Kafka\" WHERE Topic != ''__amazon_msk_canary'' AND Topic != ''Other'' AND Topic != ''__consumer_offsets'' GROUP BY Topic", "label": "", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","region": "${AWS::Region}","title": "SumOffsetLag  (All Topics)","yAxis": {"left": { "label": "Seconds", "showUnits": false}},"stat": "Average","period": 300,"stacked": false}},{"height": 6,"width": 6,"y": 1,"x": 18,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(EstimatedMaxTimeLag) FROM \"AWS/Kafka\" WHERE \"Topic\" != ''__amazon_msk_canary'' and \"Topic\" != ''Other'' and \"Topic\" != ''__consumer_offsets'' GROUP BY Topic", "label": "", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","region": "${AWS::Region}","title": "EstimatedMaxTimeLag (All Topics)","yAxis": {"left": { "label": "", "showUnits": false},"right": {"showUnits": false}},"stat": "Average","period": 300,"stacked": false}},{"height": 6,"width": 6,"y": 7,"x": 18,"type": "metric","properties": {"metrics": [[ { "expression": "SELECT AVG(RequestBytesMean) FROM \"AWS/Kafka\" GROUP BY \"Cluster Name\"", "label": "", "id": "q1", "region": "${AWS::Region}" } ]],"view": "timeSeries","stacked": false,"region": "${AWS::Region}","stat": "Average","period": 300,"title": "RequestBytesMean","yAxis": {"right": { "showUnits": false},"left": { "showUnits": false}}}},{"height":9,"width":24,"y":18,"x":0,"type":"explorer","properties":{"metrics":[{"metricName":"DeliveryToS3.DataFreshness","resourceType":"AWS::KinesisFirehose::DeliveryStream","stat":"Average"}],"labels":[{"key":"Name"}],"widgetOptions":{"legend":{"position":"bottom"},"view":"singleValue","rowsPerPage":1,"widgetsPerRow":1},"period":300,"splitBy":"","region":"${AWS::Region}","title":"Firehose : DeliveryToS3 DataFreshness"}},{"height":9,"width":24,"y":9,"x":0,"type":"explorer","properties":{"metrics":[{"metricName":"DeliveryToRedshift.Success","resourceType":"AWS::KinesisFirehose::DeliveryStream","stat":"Average"}],"labels":[{"key":"Name"}],"widgetOptions":{"legend":{"position":"bottom"},"view":"bar","rowsPerPage":1,"widgetsPerRow":1},"period":300,"splitBy":"","region":"${AWS::Region}","title":"Firehose-DeliveryToRedshiftSuccess"}}]}'
+  MSKConfiguration:
+    Type: AWS::MSK::Configuration
+    Properties:
+      Description: Configuration of the msk cluster
+      KafkaVersionsList: [3.1.1]
+      Name: msk-configuration
+      ServerProperties: |
+        auto.create.topics.enable=true
+        default.replication.factor=2
+        min.insync.replicas=2
+        num.io.threads=8
+        num.network.threads=5
+        num.partitions=1
+        num.replica.fetchers=2
+        replica.lag.time.max.ms=30000
+        socket.receive.buffer.bytes=102400
+        socket.request.max.bytes=104857600
+        socket.send.buffer.bytes=102400
+        unclean.leader.election.enable=true
+        zookeeper.session.timeout.ms=18000
+        log.retention.ms = 86400000
+        log.retention.bytes = -1
+  MSKCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      KafkaVersion: 3.1.1
+      NumberOfBrokerNodes: !Ref NoOfBrokers
+      BrokerNodeGroupInfo:
+        ClientSubnets: !Ref SSMParameterForSubnetIds
+        ConnectivityInfo:
+          PublicAccess:
+            Type: !Ref ClusterPublicAccess
+        InstanceType: !Ref ClusterInstanceType
+        SecurityGroups:
+          - !Select [ 0, !Ref SSMParameterForSecurityGroupIds]
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: !Ref EBSVolumePerBroker
+      ConfigurationInfo:
+        Arn: !GetAtt MSKConfiguration.Arn
+        Revision: 1
+      EnhancedMonitoring: DEFAULT
+      LoggingInfo:
+        BrokerLogs:
+          CloudWatchLogs:
+            Enabled: True
+            LogGroup: !Sub "${ClusterName}_LogGroup"
+      ClientAuthentication:
+        Sasl:
+          Iam:
+            Enabled: True
+          Scram:
+            Enabled: False
+      Tags:
+        Name: !Ref ClusterName
+        map-migrated: mig32266
+  MSKLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${ClusterName}_LogGroup"
+      RetentionInDays: 3
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: map-migrated
+          Value: mig32266
+  ResourceDeletionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: A role for Lambda function to delete leftover resources.
+      RoleName: ResourceDeletionLambdaRole
+      Tags:
+        - Key: Name
+          Value: leftover_resource_deletion
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+      - PolicyName: resource-deletion-cloudwatch-policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Action:
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+            Effect: Allow
+            Resource: 
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/resource_deletion_lambda:*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/resource_deletion_lambda:log-stream:*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+      - PolicyName: resource-deletion-cloudformation-policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Action:
+              - 'cloudformation:DescribeStacks'
+              - 'cloudformation:ListStacks'
+            Effect: Allow
+            Resource:
+              - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*/*"
+      - PolicyName: resource-deletion-s3-policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - s3:DeleteObjectVersion
+              - s3:DeleteObject
+              - s3:DeleteBucket
+              - s3:ListBucket
+              - s3:ListAllMyBuckets
+              - s3:ListObjectsV2
+              - s3:ListBucketVersions
+              - s3:ListObjectVersions
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource:
+              - !Sub "arn:aws:s3:::*"
+              - !Sub "arn:aws:s3:::*/*"
+      - PolicyName: AwsLambdaSecretsManagerAccess
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Action:
+              - "secretsmanager:GetSecretValue"
+              - "secretsmanager:DescribeSecret"
+              - "secretsmanager:List*"
+            Effect: Allow
+            Resource:
+              - "*"
+      - PolicyName: resource-deletion-redshift-policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Action:
+              - "redshift:ExecuteQuery"
+              - "redshift:DeleteTags"
+              - "redshift-data:ExecuteStatement"
+              - "redshift:GetClusterCredentials"
+              - "redshift:DescribeClusters"
+            Effect: Allow
+            Resource: 
+              - !Join
+                    - ':'
+                    - - arn
+                      - aws
+                      - redshift
+                      - !Ref 'AWS::Region'
+                      - !Ref 'AWS::AccountId'
+                      - dbname
+                      - !Join
+                        - /
+                        - - !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:ClusterIdentifier}}"
+                          - !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:dbname}}"    
+              - !Sub "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbuser:{{resolve:secretsmanager:${RedshiftSecret}:SecretString:ClusterIdentifier}}/{{resolve:secretsmanager:${RedshiftSecret}:SecretString:username}}"  
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+        - arn:aws:iam::aws:policy/AmazonRedshiftDataFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /     
+  LambdaLogGroup:
+   Type: AWS::Logs::LogGroup
+   Properties:
+     LogGroupName: /aws/lambda/resource_deletion_lambda
+     RetentionInDays: 30
+     Tags:
+      - Key: Name
+        Value: leftover_resource_deletion
+      - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+        Value: !FindInMap [ConfigMap, ResourceTag, Value]
+  ResourceDeletionLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - ResourceDeletionLambdaRole
+      - LambdaLogGroup
+    Properties:
+      FunctionName: resource_deletion_lambda
+      Tags:
+        - Key: Name
+          Value: leftover_resource_deletion
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+      Description: Remove S3 bucket and Redshift schema
+      Runtime: python3.9
+      Role: !GetAtt ResourceDeletionLambdaRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import logging
+          import boto3
+          import json
+          import botocore
+          import base64
+          import datetime
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info('Incoming Scheduler event input {}'.format(event))
+              if event.keys() >= {'SecretName', 'Region', 'AgeOfDeletedStackInDays'}:
+                  secret_name = event['SecretName']
+                  region_name = event['Region']
+                  days_value = int(event['AgeOfDeletedStackInDays'])
+              else:
+                  raise Exception('SecretName, Region, AgeOfDeletedStackInDays is mandatory to be passed as event input')
+
+              try:
+                  today = datetime.now()
+                  min_delete_date = today - timedelta(days=days_value)
+
+                  # Get a list of all bucket names
+                  s3 = boto3.resource('s3')
+                  all_buckets_list = [bucket.name for bucket in s3.buckets.all()]
+
+                  #Get Redshift secrets
+                  secrets_manager_response = json.loads(get_secret(secret_name, region_name))
+                  db_cluster_name = secrets_manager_response['ClusterIdentifier']
+                  db_user = secrets_manager_response['username']
+                  db_name = secrets_manager_response['dbname']
+
+                  #Declaring stack variables
+                  active_stacks = []
+                  deleted_stack_summaries = []
+                  active_tenant_name_list = []
+                  deleted_tenant_name_set = set()
+
+                  cf_client = boto3.client('cloudformation')
+
+                  #Filtering active tenant stacks and TenantName
+                  describe_stacks_paginator = cf_client.get_paginator('describe_stacks')
+                  response_iterator = describe_stacks_paginator.paginate(PaginationConfig={'MaxItems': 2000})
+                  for response in response_iterator:
+                      active_stacks += response['Stacks']
+                  for stack in active_stacks:
+                      if 'Parameters' in stack:
+                          for parameter in stack['Parameters']:
+                              if parameter['ParameterKey'] == 'TenantName':
+                                  active_tenant_name_list.append(parameter['ParameterValue'])
+        
+                  #Filtering deleted tenant stacks and TenantName
+                  list_stacks_paginator = cf_client.get_paginator('list_stacks')
+                  response_iterator = list_stacks_paginator.paginate(StackStatusFilter=['DELETE_COMPLETE'],  PaginationConfig={'MaxItems': 2000})
+                  for response in response_iterator:
+                      deleted_stack_summaries += response['StackSummaries']
+                  for stack_summary in deleted_stack_summaries:
+                      if stack_summary['DeletionTime'].date() >= min_delete_date.date() and stack_summary['DeletionTime'].date() <= today.date():
+                          deleted_stack_description = cf_client.describe_stacks(StackName = stack_summary['StackId'])
+                          for stack_description in deleted_stack_description['Stacks']:
+                              if 'Parameters' in stack_description:
+                                  for parameter in stack_description['Parameters']:
+                                      if parameter['ParameterKey'] == 'TenantName':
+                                          if parameter['ParameterValue'] != '':
+                                              deleted_tenant_name_set.add(parameter['ParameterValue'])
+                  for tenant_name in deleted_tenant_name_set:
+                      if tenant_name not in active_tenant_name_list:
+                          logger.info('Proceeding to delete leftover tenant resources for tenant : {}'.format (tenant_name))
+                          redshift_drop_execute(db_cluster_name, db_name, db_user, tenant_name)
+
+                          tenant_bucket_name = tenant_name + '-s3-' + region_name
+                          delete_tenant_bucket(all_buckets_list, tenant_bucket_name)
+              except Exception as err:
+                  logger.error(err)
+
+          # Function to drop schema and users in Redshift
+          def redshift_drop_execute(db_cluster_name, db_name, db_user, tenant_name):
+              redshift_data_client = boto3.client("redshift-data")
+
+              sql_statements = ['DROP SCHEMA IF EXISTS ' + tenant_name + ' CASCADE;',
+              'DROP USER IF EXISTS ' + tenant_name + '_db_reader;',
+              'DROP USER IF EXISTS ' + tenant_name + '_db_writer;',
+              'DROP USER IF EXISTS ' + tenant_name + '_dim_db_reader;']
+
+              redshift_data_client.batch_execute_statement(
+                ClusterIdentifier=db_cluster_name,
+                Database=db_name,
+                DbUser=db_user,
+                Sqls=sql_statements
+                )
+              logger.info('Redshift deletion process completed for the tenant : {}'.format(tenant_name))
+
+          # Function to create a generator for objects in S3 bucket, a fast approach to not reading each object name for large buckets
+          def keys(bucket_name, bucket_object, prefix='/', delimiter='/'):
+              prefix = prefix[1:] if prefix.startswith(delimiter) else prefix
+              return (_.key for _ in bucket_object.object_versions.filter(Prefix=prefix))
+
+          # Function to perform Tenant S3 Bucket Delete Operations
+          def delete_tenant_bucket(all_buckets_list, tenant_bucket_name):
+              if tenant_bucket_name in all_buckets_list:
+                  _exhausted = object()
+                  s3 = boto3.resource('s3')
+                  tenant_bucket_object = s3.Bucket(tenant_bucket_name)
+                  try:
+                      if next(keys(tenant_bucket_name, tenant_bucket_object), _exhausted) == _exhausted:
+                          tenant_bucket_object.delete()
+                          logger.info('Deleted tenant S3 bucket : {} as it was empty'.format(tenant_bucket_name))
+                      else:
+                          logger.info('Skipping delete for tenant S3 bucket : {} as it is not empty'.format  (tenant_bucket_name))
+                  except Exception as e:
+                      print('Error: {} - {}'.format(tenant_bucket_name, e))
+              else:
+                  logger.info('Tenant S3 Bucket : {} does not exist'.format(tenant_bucket_name))
+
+          # Function to retrieve AWS resource secrets from Secret Manager
+          def get_secret(secret_name, region_name):
+              print('Entered get_secret for secret_name:{0} in region:{1}'.format(secret_name, region_name))
+              secret_name = secret_name
+              region_name = region_name
+
+              # Create a Secrets Manager client
+              session = boto3.session.Session()
+              client = session.client(
+                  service_name='secretsmanager',
+                  region_name=region_name
+              )
+
+              try:
+                  get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'DecryptionFailureException':
+                      raise e
+                  elif e.response['Error']['Code'] == 'InternalServiceErrorException':
+                      raise e
+                  elif e.response['Error']['Code'] == 'InvalidParameterException':
+                      raise e
+                  elif e.response['Error']['Code'] == 'InvalidRequestException':
+                      raise e
+                  elif e.response['Error']['Code'] == 'ResourceNotFoundException':
+                      raise e
+                  logger.info("exception - ", e, e.response['Error']['Code'])
+              else:
+                  if 'SecretString' in get_secret_value_response:
+                      secret = get_secret_value_response['SecretString']
+                      return secret
+                  else:
+                      decoded_binary_secret = base64.b64decode(
+                          get_secret_value_response['SecretBinary'])
+                      return decoded_binary_secret
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    DependsOn: ResourceDeletionLambda
+    Properties:
+      Tags:
+        - Key: Name
+          Value: leftover_resource_deletion
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+      Description: A role for the EventBridge Scheduler that will trigger the Lambda function which deletes all the leftover tenant resources.
+      RoleName: RsrcDelLambEveBrdgRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - scheduler.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeLambdaInvokeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "lambda:InvokeFunction"
+                Effect: Allow
+                Resource:
+                  - !GetAtt ResourceDeletionLambda.Arn
+      Path: /
+  ResourceDeletionLambdaScheduler:
+    Type: AWS::Scheduler::Schedule
+    DependsOn: EventBridgeSchedulerRole
+    Properties:
+      Name: ResourceDelLambdaScheduler
+      Description: Invokes the Lambda function which deletes all the leftover tenant resources.
+      FlexibleTimeWindow:
+        Mode: FLEXIBLE
+        MaximumWindowInMinutes: 5
+      ScheduleExpression: cron(0 12 * * ? *)
+      State: "ENABLED"
+      Target: 
+        Arn: !GetAtt ResourceDeletionLambda.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub |
+          {
+            "Region": "${AWS::Region}",
+            "SecretName": "${RedshiftSecret}",
+            "AgeOfDeletedStackInDays": "${AgeOfDeletedStackInDays}"
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 300
+          MaximumRetryAttempts: 2
+
+  FlinkAppOperationsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+      Description: A role for lambda to use while interacting with an application.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+      - PolicyName: !Sub "logs-flinkOps-policy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Action:
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+              - 'kinesisanalytics:*'
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+            Effect: Allow
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/flinkOps*:*"
+              - !Sub "arn:aws:kinesisanalytics:${AWS::Region}:${AWS::AccountId}:application/*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/FlinkOperations_lambda*:*"
+          - Action:
+              - 'codepipeline:PutJobSuccessResult'
+              - 'codepipeline:PutJobFailureResult'
+            Effect: Allow
+            Resource:
+              - "*"
+      Path: /
+  FlinkOpsLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/FlinkOperations_lambda
+      RetentionInDays: 30
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+  FlinkAppOperations:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - FlinkAppOperationsLambdaRole
+      - FlinkOpsLambdaLogGroup
+    Properties:
+      FunctionName: FlinkOperations_lambda
+      Description: Starts/stops flink application before and after schema updates.
+      Role: !GetAtt FlinkAppOperationsLambdaRole.Arn
+      Runtime: python3.9
+      Tags:
+        - Key: !FindInMap [ConfigMap, ResourceTag, Key]
+          Value: !FindInMap [ConfigMap, ResourceTag, Value]
+      Timeout: 900
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import logging
+          import boto3
+          import json
+          import time
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          # wait duration as 2 minutes and waitCounter as 6, making it 12 mins wait duration max.
+          waitDuration = 120
+          waitCounter = 6
+          def lambda_handler(event, context):
+            logger.info('Incoming event {}'.format(event))
+            if 'CodePipeline.job' not in event:
+              logger.info('Request from EventBridge')
+              return startFlink(event)
+            else:
+              return stopFlink(event)
+
+          def getStatus(client_kda, application_name):
+            describe_response = client_kda.describe_application(ApplicationName=application_name)
+            application_status = describe_response['ApplicationDetail']['ApplicationStatus']
+            logger.info('application_status= {}' .format(application_status)) 
+            return application_status
+
+          def stopFlink(event):
+            # get application status.
+            try:
+              userParams = json.loads(event['CodePipeline.job']['data']['actionConfiguration']['configuration']['UserParameters'])
+              logger.info('User paramters {}'.format(userParams))
+              application_name = userParams['ApplicationName']
+              pipeline = boto3.client('codepipeline')
+              # use kinesisanalyticsv2 API to start an application.
+              client_kda = boto3.client('kinesisanalyticsv2',
+              region_name=userParams['Region'])
+              application_status = getStatus(client_kda, application_name)
+              
+              # stop from 'Running' state only and wait for 'UPDATING' & 'STARTING' status
+              if application_status in ["UPDATING", "STARTING"]:                
+                for x in range(waitCounter):
+                  logger.info('waiting as application is not in RUNNING state')
+                  time.sleep(waitDuration)
+                  application_status = getStatus(client_kda, application_name)
+                  if application_status == "RUNNING":
+                    logger.info('Stopping {} after wait'.format(application_name))
+                    client_kda.stop_application(ApplicationName=application_name)
+                    logger.info('Stopped Application: {}'.format(application_name))
+                    return pipeline.put_job_success_result(
+                      jobId=event['CodePipeline.job']['id'])
+ 
+                logger.info('Timed out waiting for flink application status to be in RUNNING state')
+              elif application_status in ["STOPPING", "READY"]:
+                logger.info('Application  {} is already in either STOPPING or READY state'.format(application_name))
+              else:
+                client_kda.stop_application(ApplicationName=application_name)
+                logger.info('Stopped Application: {}' .format(application_name))
+
+            except Exception as err:
+              logger.error('Exception : {}' .format(e))
+            # Returning status as 'successful' always so that lambda doesn't block 'schema update' stage in pipeline
+            finally:
+              response = pipeline.put_job_success_result(
+                  jobId=event['CodePipeline.job']['id']
+              )
+              return response
+
+          def startFlink(event):
+            try:
+
+              application_name = event['ApplicationName']
+              # use kinesisanalyticsv2 API to start an application.
+              client_kda = boto3.client('kinesisanalyticsv2',
+              region_name=event['Region'])
+              describe_response = client_kda.describe_application(ApplicationName=application_name)
+              logger.info('Describe KDA response: {}'.format(describe_response))
+              application_status = describe_response['ApplicationDetail']['ApplicationStatus']
+              logger.info('application_status= {}' .format(application_status))
+
+              if application_status in ["STOPPING"]:  
+                for x in range(waitCounter):
+                  logger.info('waiting as application is not in READY state')
+                  time.sleep(waitDuration)
+                  application_status = getStatus(client_kda, application_name)
+                  if application_status == "READY":
+                    logger.info('Starting {} after wait'.format(application_name))
+                    client_kda.start_application(ApplicationName=application_name)
+                    logger.info('Started Application: {}'.format(application_name))
+                    return {
+                      'message': 'Started Application'
+                    }
+                logger.info('Timed out waiting for flink application status to be in READY, please check application.')                
+              elif application_status in ["STARTING", "RUNNING", "UPDATING"]:
+                logger.info('Application {} is already in either Starting, running, updating state'.format(application_name)) 
+              else:
+                client_kda.start_application(ApplicationName=application_name)
+                logger.info('Started Application: {}' .format(application_name)) 
+            except Exception as err:
+              logger.error('Exception : {}' .format(err))
+              return {
+                'message': err
+              }
+
+Outputs:
+    SummaryDashboard:
+        Description: "Dashboard created to monitor data ingestion pipeline metrics"
+        Value: !Sub |
+            "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#dashboards:name=Data-Ingestion-Summary"
